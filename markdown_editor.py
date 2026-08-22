@@ -3,9 +3,9 @@ import re
 import sys
 
 import markdown
-from PyQt5.QtCore import QRegExp, Qt, QUrl
-from PyQt5.QtGui import (QColor, QFont, QIcon, QKeySequence, QSyntaxHighlighter,
-                         QTextCharFormat)
+from PyQt5.QtCore import QRegExp, Qt, QTimer, QUrl, pyqtSignal
+from PyQt5.QtGui import (QColor, QFont, QIcon, QImageReader, QKeySequence,
+                         QSyntaxHighlighter, QTextCharFormat)
 from PyQt5.QtWidgets import (QAction, QApplication, QFileDialog, QInputDialog,
                              QMainWindow, QMessageBox, QPlainTextEdit, QStyle,
                              QTabWidget, QTextBrowser, QToolBar)
@@ -25,19 +25,16 @@ QPlainTextEdit {
 }
 """
 
-PREVIEW_CSS = """
+def build_preview_css(zoom):
+    body = int(round(17 * zoom))
+    return """
 body {
     font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
-    font-size: 15px;
+    font-size: %dpx;
     color: #24292e;
     line-height: 1.6;
     margin: 12px;
 }
-h1, h2 { border-bottom: 1px solid #eaecef; padding-bottom: .3em; }
-h1 { font-size: 1.9em; }
-h2 { font-size: 1.5em; }
-h3 { font-size: 1.25em; }
-h4 { font-size: 1.05em; }
 code {
     font-family: "Consolas", "Courier New", monospace;
     background-color: #f6f8fa;
@@ -62,10 +59,10 @@ blockquote {
 table { border-collapse: collapse; }
 th, td { border: 1px solid #dfe2e5; padding: 6px 13px; }
 th { background-color: #f6f8fa; }
-img { max-width: 100%; }
+img { max-width: 100%%; }
 hr { border: none; border-top: 2px solid #eaecef; }
 a { color: #0366d6; text-decoration: none; }
-"""
+""" % body
 
 
 def resource_path(relative):
@@ -157,6 +154,21 @@ class EditorPane(QPlainTextEdit):
             self.setFont(font)
 
 
+class PreviewPane(QTextBrowser):
+    ctrl_wheel = pyqtSignal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setOpenExternalLinks(True)
+
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.ControlModifier:
+            self.ctrl_wheel.emit(event.angleDelta().y() > 0)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -170,8 +182,8 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(icon_path))
 
         self.editor = EditorPane()
-        self.preview = QTextBrowser()
-        self.preview.setOpenExternalLinks(True)
+        self.preview = PreviewPane()
+        self.preview_zoom = 1.0
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self.editor, "编辑")
@@ -185,6 +197,7 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self.editor.textChanged.connect(self.on_text_changed)
         self.editor.cursorPositionChanged.connect(self.update_status)
+        self.preview.ctrl_wheel.connect(self.zoom_preview)
 
         self.statusBar().showMessage("就绪")
         self.refresh_preview()
@@ -246,8 +259,8 @@ class MainWindow(QMainWindow):
         self.act_refresh.triggered.connect(self.refresh_preview)
         self.act_bold.triggered.connect(lambda: self.wrap_selection("**"))
         self.act_italic.triggered.connect(lambda: self.wrap_selection("*"))
-        self.act_zoom_in.triggered.connect(self.editor.zoom_in)
-        self.act_zoom_out.triggered.connect(self.editor.zoom_out)
+        self.act_zoom_in.triggered.connect(self.zoom_in_active)
+        self.act_zoom_out.triggered.connect(self.zoom_out_active)
         self.act_zoom_reset.triggered.connect(self.zoom_reset)
         self.act_about.triggered.connect(self.show_about)
 
@@ -334,12 +347,90 @@ class MainWindow(QMainWindow):
     def refresh_preview(self):
         html = markdown.markdown(
             self.editor.toPlainText(), extensions=["extra", "sane_lists"])
+        html = self._postprocess_html(html, self.preview_zoom)
         self.preview.setHtml(
             "<html><head><meta charset='utf-8'><style>%s</style></head>"
-            "<body>%s</body></html>" % (PREVIEW_CSS, html))
+            "<body>%s</body></html>" % (build_preview_css(self.preview_zoom), html))
         if self.current_file:
             self.preview.document().setBaseUrl(
                 QUrl.fromLocalFile(os.path.dirname(os.path.abspath(self.current_file)) + os.sep))
+
+    def _postprocess_html(self, html, zoom):
+        sizes = [32, 24, 19, 16, 13, 11]
+        margins = [(16, 8), (14, 7), (12, 6), (10, 5), (8, 4), (6, 3)]
+
+        def heading_open(match):
+            level = int(match.group(1))
+            size = int(round(sizes[level - 1] * zoom))
+            top, bottom = margins[level - 1]
+            return ('<p style="font-size:%dpx;font-weight:bold;'
+                    'margin-top:%dpx;margin-bottom:%dpx">'
+                    % (size, int(round(top * zoom)), int(round(bottom * zoom))))
+
+        html = re.sub(r"<h([1-6])>", heading_open, html)
+        html = re.sub(r"</h[1-6]>", "</p>", html)
+        return self._scale_images(html, zoom)
+
+    def _scale_images(self, html, zoom):
+        if zoom == 1.0:
+            return html
+
+        def repl(match):
+            if "width=" in match.group(0) or "height=" in match.group(0):
+                return match.group(0)
+            head, src, rest, slash = match.groups()
+            path = None
+            if src.startswith("file:///"):
+                path = QUrl(src).toLocalFile()
+            elif not src.startswith(("http://", "https://", "data:")):
+                base = (os.path.dirname(os.path.abspath(self.current_file))
+                        if self.current_file else ".")
+                path = os.path.join(base, src)
+            if not path or not os.path.isfile(path):
+                return match.group(0)
+            size = QImageReader(path).size()
+            if not size.isValid():
+                return match.group(0)
+            w = max(1, round(size.width() * zoom))
+            h = max(1, round(size.height() * zoom))
+            return '%s%s width="%d" height="%d"%s>' % (head, rest, w, h, slash)
+
+        return re.sub(r'(<img[^>]*?src="([^"]+)")([^>]*?)(/?)>', repl, html)
+
+    def zoom_preview(self, up):
+        old = self.preview_zoom
+        new = old * (1.1 if up else 1 / 1.1)
+        self.preview_zoom = max(0.5, min(3.0, new))
+        if abs(self.preview_zoom - old) < 1e-9:
+            return
+        bar = self.preview.verticalScrollBar()
+        pos = bar.value()
+        self.refresh_preview()
+        QTimer.singleShot(0, lambda: bar.setValue(pos))
+        self.statusBar().showMessage("预览缩放: %d%%" % round(self.preview_zoom * 100))
+
+    def zoom_in_active(self):
+        if self.tabs.currentIndex() == 1:
+            self.zoom_preview(True)
+        else:
+            self.editor.zoom_in()
+
+    def zoom_out_active(self):
+        if self.tabs.currentIndex() == 1:
+            self.zoom_preview(False)
+        else:
+            self.editor.zoom_out()
+
+    def zoom_reset(self):
+        if self.tabs.currentIndex() == 1:
+            self.preview_zoom = 1.0
+            self.refresh_preview()
+            self.statusBar().showMessage("预览缩放: 100%")
+        else:
+            font = QFont("Consolas")
+            font.setStyleHint(QFont.Monospace)
+            font.setPointSize(13)
+            self.editor.setFont(font)
 
     def wrap_selection(self, token):
         cursor = self.editor.textCursor()
@@ -363,12 +454,6 @@ class MainWindow(QMainWindow):
             found = self.editor.find(keyword)
         self.statusBar().showMessage(
             "已找到: %s" % keyword if found else "未找到: %s" % keyword)
-
-    def zoom_reset(self):
-        font = QFont("Consolas")
-        font.setStyleHint(QFont.Monospace)
-        font.setPointSize(13)
-        self.editor.setFont(font)
 
     # ---------- 文件操作 ----------
     def maybe_discard(self):
@@ -473,7 +558,7 @@ class MainWindow(QMainWindow):
             "<h3>%s v%s</h3>"
             "<p>一款简洁的 Markdown 编辑器,支持语法高亮编辑与实时预览。</p>"
             "<p>快捷键: Ctrl+N 新建 | Ctrl+O 打开 | Ctrl+S 保存 | "
-            "Ctrl+B/I 加粗/斜体 | F5 刷新预览 | Ctrl+滚轮 缩放字体</p>"
+            "Ctrl+B/I 加粗/斜体 | F5 刷新预览 | Ctrl+滚轮 缩放字体/预览</p>"
             % (APP_NAME, APP_VERSION))
 
 
