@@ -24,6 +24,8 @@
   ('contextvars', 'E:\\python\\lib\\contextvars.py', 'PYMODULE'),
   ('copy', 'E:\\python\\lib\\copy.py', 'PYMODULE'),
   ('csv', 'E:\\python\\lib\\csv.py', 'PYMODULE'),
+  ('ctypes', 'E:\\python\\lib\\ctypes\\__init__.py', 'PYMODULE'),
+  ('ctypes._endian', 'E:\\python\\lib\\ctypes\\_endian.py', 'PYMODULE'),
   ('dataclasses', 'E:\\python\\lib\\dataclasses.py', 'PYMODULE'),
   ('datetime', 'E:\\python\\lib\\datetime.py', 'PYMODULE'),
   ('decimal', 'E:\\python\\lib\\decimal.py', 'PYMODULE'),
