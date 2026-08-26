@@ -5,17 +5,107 @@ import ctypes
 
 import markdown
 from PyQt5.QtCore import QRect, QRegExp, QSize, Qt, QTimer, QUrl, pyqtSignal
-from PyQt5.QtGui import (QColor, QFont, QIcon, QImageReader, QKeySequence,
-                         QPainter, QPixmap, QSyntaxHighlighter, QTextCharFormat,
-                         QTextFormat)
+from PyQt5.QtGui import (QColor, QDesktopServices, QFont, QIcon, QImageReader,
+                         QKeySequence, QPainter, QPixmap, QSyntaxHighlighter,
+                         QTextCharFormat, QTextFormat)
+
+try:
+    from PyQt5.QtWebEngineWidgets import (QWebEnginePage, QWebEngineSettings,
+                                          QWebEngineView)
+    WEBENGINE_AVAILABLE = True
+except ImportError:
+    WEBENGINE_AVAILABLE = False
 from PyQt5.QtWidgets import (QAction, QApplication, QFileDialog, QInputDialog,
                              QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
                              QStyle, QTabWidget, QTextBrowser, QTextEdit,
                              QToolBar, QWidget)
 
 APP_NAME = "MK编辑器"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 FILE_FILTER = "Markdown 文件 (*.md *.markdown);;文本文件 (*.txt);;所有文件 (*.*)"
+
+# ---------- 数学公式 (LaTeX) 支持 ----------
+_MATH_BLOCK_RE = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
+_MATH_INLINE_RE = re.compile(r"(?<![\\$])\$(?!\s|$)([^\n$]+?)(?<!\s)\$")
+_FENCED_CODE_RE = re.compile(r"(^```.*?^```)", re.DOTALL | re.MULTILINE)
+_INLINE_CODE_RE = re.compile(r"(`[^`\n]+`)")
+_MATH_PH = "\x00MATH%d\x00"
+
+KATEX_RENDER_SCRIPT = (
+    "<script>%s</script>"
+    "<script>document.addEventListener('DOMContentLoaded',function(){"
+    "document.querySelectorAll('.math-inline').forEach(function(el){"
+    "katex.render(el.textContent,el,{displayMode:false,throwOnError:false});});"
+    "document.querySelectorAll('.math-display').forEach(function(el){"
+    "katex.render(el.textContent,el,{displayMode:true,throwOnError:false});});"
+    "});</script>"
+)
+
+
+def extract_math(text):
+    """把 $$...$$ / $...$ 公式替换为占位符(跳过代码块和行内代码)。
+
+    返回 (替换后的文本, [(tex, display), ...])。"""
+    math_list = []
+
+    def stash(tex, display):
+        math_list.append((tex, display))
+        return _MATH_PH % (len(math_list) - 1)
+
+    out = []
+    for i, seg in enumerate(_FENCED_CODE_RE.split(text)):
+        if i % 2 == 1:  # 围栏代码块原样保留
+            out.append(seg)
+            continue
+        for j, part in enumerate(_INLINE_CODE_RE.split(seg)):
+            if j % 2 == 1:  # 行内代码原样保留
+                out.append(part)
+                continue
+            part = _MATH_BLOCK_RE.sub(
+                lambda m: stash(m.group(1).strip(), True), part)
+            part = _MATH_INLINE_RE.sub(
+                lambda m: stash(m.group(1), False), part)
+            out.append(part)
+    return "".join(out), math_list
+
+
+def restore_math(html, math_list):
+    """把 HTML 中的公式占位符替换为 KaTeX 可渲染的元素。"""
+    for i, (tex, display) in enumerate(math_list):
+        esc = tex.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        if display:
+            element = '<div class="math-display">%s</div>' % esc
+            # 独立成段的块级公式: 整个 <p> 一并替换, 避免 <div> 嵌在 <p> 里
+            html = html.replace("<p>%s</p>" % (_MATH_PH % i), element)
+        else:
+            element = '<span class="math-inline">%s</span>' % esc
+        html = html.replace(_MATH_PH % i, element)
+    return html
+
+
+_KATEX_CACHE = None
+
+
+def get_katex_assets():
+    """读取本地 KaTeX 资源, 字体引用改写为绝对 file:// 路径后内联返回。"""
+    global _KATEX_CACHE
+    if _KATEX_CACHE is not None:
+        return _KATEX_CACHE or None
+    base = resource_path(os.path.join("assets", "katex"))
+    try:
+        with open(os.path.join(base, "katex.min.css"), "r", encoding="utf-8") as f:
+            css = f.read()
+        with open(os.path.join(base, "katex.min.js"), "r", encoding="utf-8") as f:
+            js = f.read()
+    except OSError:
+        _KATEX_CACHE = False
+        return None
+    font_base = QUrl.fromLocalFile(os.path.join(base, "")).toString()
+    if not font_base.endswith("/"):
+        font_base += "/"
+    css = css.replace("fonts/", font_base + "fonts/")
+    _KATEX_CACHE = (css, js)
+    return _KATEX_CACHE
 
 
 def setup_rounded_menu(menu):
@@ -244,6 +334,7 @@ QToolTip { background-color: #21262d; color: #e6edf3; border: 1px solid #30363d;
 def build_preview_css(zoom, dark=1):
     body = int(round(17 * zoom))
     if dark:
+        bg = "#0d1117"
         text = "#e6edf3"
         code_bg = "#161b22"
         code_border = "#30363d"
@@ -254,6 +345,7 @@ def build_preview_css(zoom, dark=1):
         hr_color = "#30363d"
         link = "#58a6ff"
     else:
+        bg = "#ffffff"
         text = "#24292e"
         code_bg = "#f6f8fa"
         code_border = "#e1e4e8"
@@ -268,6 +360,7 @@ body {
     font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
     font-size: %dpx;
     color: %s;
+    background-color: %s;
     line-height: 1.6;
     margin: 12px;
 }
@@ -298,7 +391,10 @@ th { background-color: %s; }
 img { max-width: 100%%; }
 hr { border: none; border-top: 2px solid %s; }
 a { color: %s; text-decoration: none; }
-""" % (body, text, code_bg, code_bg, code_border, quote_border, quote_color,
+.math-display { text-align: center; margin: 1em 0; overflow-x: auto; }
+.math-inline { white-space: nowrap; }
+.katex { font-size: 1.1em; }
+""" % (body, text, bg, code_bg, code_bg, code_border, quote_border, quote_color,
        table_border, th_bg, hr_color, link)
 
 
@@ -327,11 +423,13 @@ class MarkdownHighlighter(QSyntaxHighlighter):
             "header": "#0366d6", "bold": "#6f42c1", "italic": "#e36209",
             "code": "#d73a49", "link": "#0366d6", "list": "#e36209",
             "quote": "#6a737d", "hr": "#d1d5da", "codeblock": "#d73a49",
+            "math": "#22863a",
         },
         "dark": {
             "header": "#79b8ff", "bold": "#bc8cff", "italic": "#ffab70",
             "code": "#ff7b72", "link": "#79b8ff", "list": "#ffab70",
             "quote": "#8b949e", "hr": "#484f58", "codeblock": "#ff7b72",
+            "math": "#85e89d",
         },
     }
 
@@ -369,6 +467,7 @@ class MarkdownHighlighter(QSyntaxHighlighter):
             (QRegExp(r"(?<!_)_[^_\n]+_(?!_)"), self._fmt(p["italic"], italic=True)),
             (QRegExp(r"`[^`\n]+`"), self._fmt(p["code"])),
             (QRegExp(r"\[[^\]]+\]\([^)\s]+\)"), self._fmt(p["link"])),
+            (QRegExp(r"\$\$[^$]*\$\$|\$[^$\n]+\$"), self._fmt(p["math"])),
             (QRegExp(r"^\s*(?:[-*+]|\d+\.)\s+"), self._fmt(p["list"])),
             (QRegExp(r"^\s*>.*$"), self._fmt(p["quote"], italic=True)),
             (QRegExp(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$"), self._fmt(p["hr"])),
@@ -511,25 +610,56 @@ class EditorPane(QPlainTextEdit):
             self.setFont(font)
 
 
-class PreviewPane(QTextBrowser):
-    ctrl_wheel = pyqtSignal(bool)
+if WEBENGINE_AVAILABLE:
+    class _ExternalLinkPage(QWebEnginePage):
+        """链接点击交给系统浏览器, 预览页本身不跳转。"""
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("preview")
-        self.setOpenExternalLinks(True)
+        def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+            if nav_type == QWebEnginePage.NavigationTypeLinkClicked:
+                QDesktopServices.openUrl(url)
+                return False
+            return True
 
-    def wheelEvent(self, event):
-        if event.modifiers() & Qt.ControlModifier:
-            self.ctrl_wheel.emit(event.angleDelta().y() > 0)
-            event.accept()
-            return
-        super().wheelEvent(event)
+    class PreviewPane(QWebEngineView):
+        ctrl_wheel = pyqtSignal(bool)
 
-    def contextMenuEvent(self, event):
-        menu = self.createStandardContextMenu()
-        setup_rounded_menu(menu)
-        menu.exec_(event.globalPos())
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setObjectName("preview")
+            self.setPage(_ExternalLinkPage(self))
+            settings = self.settings()
+            settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
+            settings.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls, True)
+            settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, False)
+            settings.setAttribute(QWebEngineSettings.ErrorPageEnabled, False)
+
+        def wheelEvent(self, event):
+            if event.modifiers() & Qt.ControlModifier:
+                self.ctrl_wheel.emit(event.angleDelta().y() > 0)
+                event.accept()
+                return
+            super().wheelEvent(event)
+
+else:
+    class PreviewPane(QTextBrowser):
+        ctrl_wheel = pyqtSignal(bool)
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setObjectName("preview")
+            self.setOpenExternalLinks(True)
+
+        def wheelEvent(self, event):
+            if event.modifiers() & Qt.ControlModifier:
+                self.ctrl_wheel.emit(event.angleDelta().y() > 0)
+                event.accept()
+                return
+            super().wheelEvent(event)
+
+        def contextMenuEvent(self, event):
+            menu = self.createStandardContextMenu()
+            setup_rounded_menu(menu)
+            menu.exec_(event.globalPos())
 
 
 class MainWindow(QMainWindow):
@@ -563,6 +693,10 @@ class MainWindow(QMainWindow):
         self.editor.textChanged.connect(self.on_text_changed)
         self.editor.cursorPositionChanged.connect(self.update_status)
         self.preview.ctrl_wheel.connect(self.zoom_preview)
+        if WEBENGINE_AVAILABLE:
+            # WebEngine 重新加载页面后缩放比例会重置, 需重新应用
+            self.preview.loadFinished.connect(
+                lambda _ok: self.preview.setZoomFactor(self.preview_zoom))
 
         self.statusBar().showMessage("就绪")
         self.apply_theme()
@@ -603,6 +737,8 @@ class MainWindow(QMainWindow):
             style.standardIcon(QStyle.SP_BrowserReload), "刷新预览", self)
         self.act_bold = QAction(make_text_icon("B", "#24292e", bold=True), "加粗", self)
         self.act_italic = QAction(make_text_icon("I", "#24292e", italic=True), "斜体", self)
+        self.act_math_inline = QAction(make_text_icon("∑", "#24292e"), "插入行内公式", self)
+        self.act_math_block = QAction("插入公式块", self)
         self.act_zoom_in = QAction("放大字体", self)
         self.act_zoom_out = QAction("缩小字体", self)
         self.act_zoom_reset = QAction("恢复默认字号", self)
@@ -624,6 +760,8 @@ class MainWindow(QMainWindow):
         self.act_refresh.setShortcut("F5")
         self.act_bold.setShortcut(QKeySequence.Bold)
         self.act_italic.setShortcut(QKeySequence.Italic)
+        self.act_math_inline.setShortcut("Ctrl+M")
+        self.act_math_block.setShortcut("Ctrl+Shift+M")
         self.act_zoom_in.setShortcut(QKeySequence.ZoomIn)
         self.act_zoom_out.setShortcut(QKeySequence.ZoomOut)
         self.act_zoom_reset.setShortcut("Ctrl+0")
@@ -637,6 +775,8 @@ class MainWindow(QMainWindow):
             (self.act_redo, "重做 (Ctrl+Y)"),
             (self.act_bold, "加粗 (Ctrl+B)"),
             (self.act_italic, "斜体 (Ctrl+I)"),
+            (self.act_math_inline, "插入行内公式 $...$ (Ctrl+M)"),
+            (self.act_math_block, "插入公式块 $$...$$ (Ctrl+Shift+M)"),
             (self.act_refresh, "刷新预览 (F5)"),
         ]:
             action.setToolTip(tip)
@@ -656,6 +796,8 @@ class MainWindow(QMainWindow):
         self.act_refresh.triggered.connect(self.refresh_preview)
         self.act_bold.triggered.connect(lambda: self.wrap_selection("**"))
         self.act_italic.triggered.connect(lambda: self.wrap_selection("*"))
+        self.act_math_inline.triggered.connect(lambda: self.wrap_selection("$"))
+        self.act_math_block.triggered.connect(self.insert_math_block)
         self.act_zoom_in.triggered.connect(self.zoom_in_active)
         self.act_zoom_out.triggered.connect(self.zoom_out_active)
         self.act_zoom_reset.triggered.connect(self.zoom_reset)
@@ -694,6 +836,9 @@ class MainWindow(QMainWindow):
         menu_edit.addAction(self.act_select_all)
         menu_edit.addSeparator()
         menu_edit.addAction(self.act_find)
+        menu_edit.addSeparator()
+        menu_edit.addAction(self.act_math_inline)
+        menu_edit.addAction(self.act_math_block)
 
         menu_view = self.menuBar().addMenu("视图(&V)")
         setup_rounded_menu(menu_view)
@@ -724,6 +869,7 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         toolbar.addAction(self.act_bold)
         toolbar.addAction(self.act_italic)
+        toolbar.addAction(self.act_math_inline)
         toolbar.addSeparator()
         toolbar.addAction(self.act_refresh)
 
@@ -732,9 +878,14 @@ class MainWindow(QMainWindow):
         QApplication.instance().setStyleSheet(DARK_QSS if self.dark else LIGHT_QSS)
         self.editor.set_dark(self.dark)
         self.set_title_bar_theme(self.dark)
+        if WEBENGINE_AVAILABLE:
+            # WebEngine 页面外边缘(body margin 区域)的背景色
+            self.preview.page().setBackgroundColor(
+                QColor("#0d1117" if self.dark else "#ffffff"))
         color = "#e6edf3" if self.dark else "#24292e"
         self.act_bold.setIcon(make_text_icon("B", color, bold=True))
         self.act_italic.setIcon(make_text_icon("I", color, italic=True))
+        self.act_math_inline.setIcon(make_text_icon("∑", color))
         self.act_theme.setText("切换到浅色主题" if self.dark else "切换到深色主题")
         self.refresh_preview()
 
@@ -769,15 +920,34 @@ class MainWindow(QMainWindow):
             self.refresh_preview()
 
     def refresh_preview(self):
-        html = markdown.markdown(
-            self.editor.toPlainText(), extensions=["extra", "sane_lists"])
-        html = self._postprocess_html(html, self.preview_zoom)
-        self.preview.setHtml(
-            "<html><head><meta charset='utf-8'><style>%s</style></head>"
-            "<body>%s</body></html>" % (build_preview_css(self.preview_zoom, self.dark), html))
+        text, math_list = extract_math(self.editor.toPlainText())
+        html = markdown.markdown(text, extensions=["extra", "sane_lists"])
+        html = restore_math(html, math_list)
+        # WebEngine 用原生 zoomFactor 缩放, CSS 不再重复放大
+        css_zoom = 1.0 if WEBENGINE_AVAILABLE else self.preview_zoom
+        html = self._postprocess_html(html, css_zoom)
+        page = self._wrap_preview_html(html, css_zoom)
         if self.current_file:
-            self.preview.document().setBaseUrl(
-                QUrl.fromLocalFile(os.path.dirname(os.path.abspath(self.current_file)) + os.sep))
+            base_url = QUrl.fromLocalFile(
+                os.path.dirname(os.path.abspath(self.current_file)) + os.sep)
+        else:
+            base_url = QUrl.fromLocalFile(os.getcwd() + os.sep)
+        if WEBENGINE_AVAILABLE:
+            self.preview.setHtml(page, base_url)
+        else:
+            self.preview.setHtml(page)
+            self.preview.document().setBaseUrl(base_url)
+
+    def _wrap_preview_html(self, body_html, css_zoom):
+        katex_head = katex_script = ""
+        assets = get_katex_assets()
+        if assets:
+            katex_head = "<style>%s</style>" % assets[0]
+            katex_script = KATEX_RENDER_SCRIPT % assets[1]
+        return ("<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                "<style>%s</style>%s</head><body>%s%s</body></html>"
+                % (build_preview_css(css_zoom, self.dark),
+                   katex_head, body_html, katex_script))
 
     def _postprocess_html(self, html, zoom):
         sizes = [32, 24, 19, 16, 13, 11]
@@ -827,10 +997,13 @@ class MainWindow(QMainWindow):
         self.preview_zoom = max(0.5, min(3.0, new))
         if abs(self.preview_zoom - old) < 1e-9:
             return
-        bar = self.preview.verticalScrollBar()
-        pos = bar.value()
-        self.refresh_preview()
-        QTimer.singleShot(0, lambda: bar.setValue(pos))
+        if WEBENGINE_AVAILABLE:
+            self.preview.setZoomFactor(self.preview_zoom)
+        else:
+            bar = self.preview.verticalScrollBar()
+            pos = bar.value()
+            self.refresh_preview()
+            QTimer.singleShot(0, lambda: bar.setValue(pos))
         self.statusBar().showMessage("预览缩放: %d%%" % round(self.preview_zoom * 100))
 
     def zoom_in_active(self):
@@ -848,7 +1021,10 @@ class MainWindow(QMainWindow):
     def zoom_reset(self):
         if self.tabs.currentIndex() == 1:
             self.preview_zoom = 1.0
-            self.refresh_preview()
+            if WEBENGINE_AVAILABLE:
+                self.preview.setZoomFactor(1.0)
+            else:
+                self.refresh_preview()
             self.statusBar().showMessage("预览缩放: 100%")
         else:
             font = QFont("Consolas")
@@ -865,6 +1041,13 @@ class MainWindow(QMainWindow):
         cursor.setPosition(cursor.position() - len(token))
         if not cursor.selectedText():
             self.editor.setTextCursor(cursor)
+
+    def insert_math_block(self):
+        cursor = self.editor.textCursor()
+        text = cursor.selectedText().replace(" ", "\n")
+        if not text:
+            text = "E = mc^2"
+        cursor.insertText("$$\n" + text + "\n$$\n")
 
     def find_text(self):
         keyword, ok = QInputDialog.getText(self, "查找", "输入要查找的内容:")
@@ -981,13 +1164,29 @@ class MainWindow(QMainWindow):
             self, "关于 %s" % APP_NAME,
             "<h3>%s v%s</h3>"
             "<p>一款简洁的 Markdown 编辑器,支持语法高亮编辑与实时预览。</p>"
+            "<p>支持 LaTeX 数学公式: 行内 $...$, 块级 $$...$$(KaTeX 渲染)。</p>"
             "<p>快捷键: Ctrl+N 新建 | Ctrl+O 打开 | Ctrl+S 保存 | "
-            "Ctrl+B/I 加粗/斜体 | F5 刷新预览 | Ctrl+滚轮 缩放字体/预览 | "
-            "Ctrl+Shift+D 切换主题</p>"
+            "Ctrl+B/I 加粗/斜体 | Ctrl+M 行内公式 | Ctrl+Shift+M 公式块 | "
+            "F5 刷新预览 | Ctrl+滚轮 缩放字体/预览 | Ctrl+Shift+D 切换主题</p>"
             % (APP_NAME, APP_VERSION))
 
 
+def configure_webengine():
+    """创建 QApplication 前的 WebEngine 环境设置。
+
+    - AA_ShareOpenGLContexts 是 QtWebEngine 正常工作的前提;
+    - 部分安全软件(如终端管控/零信任客户端)会拦截 Chromium 沙箱子进程,
+      导致渲染进程一启动就被杀, 因此关闭 Chromium 沙箱。预览内容均为
+      本地生成的可信 HTML 且已禁止访问远程 URL, 风险可控。"""
+    QApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+    if "--no-sandbox" not in flags:
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (flags + " --no-sandbox").strip()
+
+
 def main():
+    if WEBENGINE_AVAILABLE:
+        configure_webengine()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")

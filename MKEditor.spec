@@ -5,7 +5,7 @@ a = Analysis(
     ['markdown_editor.py'],
     pathex=[],
     binaries=[],
-    datas=[('icon.ico', '.')],
+    datas=[('icon.ico', '.'), ('assets/katex', 'assets/katex')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
