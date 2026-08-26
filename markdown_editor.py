@@ -113,6 +113,25 @@ def setup_rounded_menu(menu):
     menu.setWindowFlag(Qt.FramelessWindowHint, True)
     menu.setWindowFlag(Qt.NoDropShadowWindowHint, True)
 
+
+def set_title_bar_theme(window, dark):
+    if os.name != "nt":
+        return
+
+    hwnd = int(window.winId())
+    value = ctypes.c_int(1 if dark else 0)
+    dwmapi = ctypes.windll.dwmapi
+
+    # 20 适用于较新的 Windows，19 兼容部分旧版本
+    result = dwmapi.DwmSetWindowAttribute(
+        hwnd, 20, ctypes.byref(value), ctypes.sizeof(value)
+    )
+
+    if result != 0:
+        dwmapi.DwmSetWindowAttribute(
+            hwnd, 19, ctypes.byref(value), ctypes.sizeof(value)
+        )
+
 LIGHT_QSS = """
 QMenuBar,
 QMenu,
@@ -219,6 +238,8 @@ QLineEdit {
     selection-background-color: #b3d7ff;
 }
 QLabel { color: #24292e; }
+QMessageBox { background-color: #f6f8fa; color: #24292e; }
+QMessageBox QLabel { color: #24292e; }
 QToolTip { background-color: #24292e; color: #ffffff; border: none; padding: 4px 8px; }
 """
 
@@ -328,7 +349,9 @@ QLineEdit {
     selection-background-color: #264f78;
 }
 QLabel { color: #e6edf3; }
-QToolTip { background-color: #21262d; color: #e6edf3; border: 1px solid #30363d; padding: 4px 8px; }
+QMessageBox { background-color: #161b22; color: #e6edf3; }
+QMessageBox QLabel { color: #e6edf3; }
+QToolTip { background-color:  #21262d; color: #e6edf3; border: 1px solid #30363d; padding: 4px 8px; }
 """
 
 def build_preview_css(zoom, dark=1):
@@ -413,8 +436,15 @@ def make_text_icon(text, color, bold=False, italic=False):
 
 
 def resource_path(relative):
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, relative)
+    """兼容 PyInstaller 两种布局: 单文件(_MEIPASS) 与文件夹模式(根目录或 _internal 子目录)。"""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return os.path.join(meipass, relative)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    for cand in (base_dir, os.path.join(base_dir, "_internal")):
+        if os.path.exists(os.path.join(cand, relative)):
+            return os.path.join(cand, relative)
+    return os.path.join(base_dir, relative)
 
 
 class MarkdownHighlighter(QSyntaxHighlighter):
@@ -702,22 +732,7 @@ class MainWindow(QMainWindow):
         self.apply_theme()
     # ---------- Windows 10/11 深色标题栏 ----------
     def set_title_bar_theme(self, dark):
-        if os.name != "nt":
-            return
-
-        hwnd = int(self.winId())
-        value = ctypes.c_int(1 if dark else 0)
-        dwmapi = ctypes.windll.dwmapi
-
-        # 20 适用于较新的 Windows，19 兼容部分旧版本
-        result = dwmapi.DwmSetWindowAttribute(
-            hwnd, 20, ctypes.byref(value), ctypes.sizeof(value)
-        )
-
-        if result != 0:
-            dwmapi.DwmSetWindowAttribute(
-                hwnd, 19, ctypes.byref(value), ctypes.sizeof(value)
-            )
+        set_title_bar_theme(self, dark)
     # ---------- 界面构建 ----------
     def _build_actions(self):
         style = self.style()
@@ -1066,10 +1081,15 @@ class MainWindow(QMainWindow):
     def maybe_discard(self):
         if not self.is_dirty():
             return True
-        ret = QMessageBox.question(
-            self, APP_NAME, "当前文件有未保存的修改,是否放弃修改?",
-            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-            QMessageBox.Cancel)
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle(APP_NAME)
+        dialog.setText("当前文件有未保存的修改,是否放弃修改?")
+        dialog.setIcon(QMessageBox.Question)
+        dialog.setStandardButtons(
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+        dialog.setDefaultButton(QMessageBox.Cancel)
+        set_title_bar_theme(dialog, self.dark)
+        ret = dialog.exec_()
         if ret == QMessageBox.Yes:
             return True
         if ret == QMessageBox.No:
