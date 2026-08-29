@@ -1174,8 +1174,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, APP_NAME, "无法打开文件:\n%s" % e)
             return
         self.current_file = path
-        self.saved_text = text
         self.editor.setPlainText(text)
+        # 以编辑器规范化后的内容作为基准,避免 \r\n 转 \n 或末尾换行被
+        # Qt 剥离导致的"虚假未保存"(is_dirty 比较的是 toPlainText)。
+        self.saved_text = self.editor.toPlainText()
         self.editor.moveCursor(self.editor.textCursor().Start)
         self.refresh_preview()
         self.on_text_changed()
