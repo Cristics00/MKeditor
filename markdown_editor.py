@@ -1,10 +1,13 @@
+import base64
+import json
 import os
 import re
 import sys
 import ctypes
 
 import markdown
-from PyQt5.QtCore import QRect, QRegExp, QSize, Qt, QTimer, QUrl, pyqtSignal
+from PyQt5.QtCore import (QByteArray, QRect, QRegExp, QSize, Qt, QTimer,
+                          QUrl, pyqtSignal)
 from PyQt5.QtGui import (QColor, QDesktopServices, QFont, QIcon, QImageReader,
                          QKeySequence, QPainter, QPixmap, QSyntaxHighlighter,
                          QTextCharFormat, QTextFormat)
@@ -21,8 +24,37 @@ from PyQt5.QtWidgets import (QAction, QApplication, QFileDialog, QInputDialog,
                              QToolBar, QWidget)
 
 APP_NAME = "MK编辑器"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 FILE_FILTER = "Markdown 文件 (*.md *.markdown);;文本文件 (*.txt);;所有文件 (*.*)"
+
+# ---------- 配置持久化 ----------
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".mkeditor.json")
+CONFIG_DEFAULTS = {"dark": 1, "font_size": 13, "preview_zoom": 1.0,
+                   "tab_index": 0, "maximized": False, "geometry": ""}
+
+
+def load_config():
+    """读取用户配置, 损坏或缺失时回退到默认值。"""
+    config = dict(CONFIG_DEFAULTS)
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            config.update(data)
+    except (OSError, ValueError):
+        pass
+    # 数值范围钳制, 防止手改配置文件导致异常
+    config["dark"] = 1 if config.get("dark") else 0
+    try:
+        config["font_size"] = min(40, max(8, int(config["font_size"])))
+    except (TypeError, ValueError):
+        config["font_size"] = 13
+    try:
+        config["preview_zoom"] = min(3.0, max(0.5, float(config["preview_zoom"])))
+    except (TypeError, ValueError):
+        config["preview_zoom"] = 1.0
+    config["tab_index"] = 1 if config.get("tab_index") == 1 else 0
+    return config
 
 # ---------- 数学公式 (LaTeX) 支持 ----------
 _MATH_BLOCK_RE = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
@@ -695,11 +727,17 @@ else:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.config = load_config()
         self.current_file = None
         self.saved_text = ""
-        self.dark = 1
+        self.dark = self.config["dark"]
         self.setWindowTitle(APP_NAME)
         self.resize(1024, 720)
+        if self.config["geometry"]:
+            self.restoreGeometry(
+                QByteArray(base64.b64decode(self.config["geometry"])))
+        if self.config["maximized"]:
+            self.setWindowState(self.windowState() | Qt.WindowMaximized)
 
         icon_path = resource_path("icon.ico")
         if os.path.exists(icon_path):
@@ -708,7 +746,13 @@ class MainWindow(QMainWindow):
         self.editor = EditorPane()
         self.editor.setObjectName("editor")
         self.preview = PreviewPane()
-        self.preview_zoom = 1.0
+        self.preview_zoom = self.config["preview_zoom"]
+        if WEBENGINE_AVAILABLE:
+            self.preview.setZoomFactor(self.preview_zoom)
+        font = self.editor.font()
+        if font.pointSize() != self.config["font_size"]:
+            font.setPointSize(self.config["font_size"])
+            self.editor.setFont(font)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self.editor, "编辑")
@@ -729,6 +773,7 @@ class MainWindow(QMainWindow):
                 lambda _ok: self.preview.setZoomFactor(self.preview_zoom))
 
         self.statusBar().showMessage("就绪")
+        self.tabs.setCurrentIndex(self.config["tab_index"])
         self.apply_theme()
     # ---------- Windows 10/11 深色标题栏 ----------
     def set_title_bar_theme(self, dark):
@@ -1173,8 +1218,26 @@ class MainWindow(QMainWindow):
                 self.open_file(path)
                 break
 
+    def _save_config(self):
+        """把用户偏好写入配置文件(主题/字号/缩放/页签/窗口状态)。"""
+        config = {
+            "dark": 1 if self.dark else 0,
+            "font_size": self.editor.font().pointSize(),
+            "preview_zoom": round(self.preview_zoom, 4),
+            "tab_index": self.tabs.currentIndex(),
+            "maximized": self.isMaximized(),
+            "geometry": base64.b64encode(
+                self.saveGeometry().data()).decode("ascii"),
+        }
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(config, f)
+        except OSError:
+            pass  # 配置写失败不影响退出
+
     def closeEvent(self, event):
         if self.maybe_discard():
+            self._save_config()
             event.accept()
         else:
             event.ignore()

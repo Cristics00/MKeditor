@@ -1,12 +1,11 @@
 @echo off
-chcp 65001 >nul
-echo 正在打包 MK编辑器(非压缩方式)...
-pyinstaller --noconsole --name=MKEditor --icon=icon.ico --add-data "icon.ico;." --add-data "assets/katex;assets/katex" --clean -y markdown_editor.py
+cd /d "%~dp0"
+REM Build with the project Python that has PyQt5/PyQtWebEngine/PyInstaller installed.
+REM MKEditor.spec already includes the icon and assets/katex data directories.
+E:\python\python.exe -m PyInstaller MKEditor.spec --clean -y
 if %errorlevel%==0 (
-    echo.
-    echo 打包完成!程序位于 dist\MKEditor\MKEditor.exe
+    echo Build succeeded. Output: dist\MKEditor\MKEditor.exe
 ) else (
-    echo.
-    echo 打包失败,请检查上方错误信息。
+    echo Build failed. See error messages above.
 )
 pause
